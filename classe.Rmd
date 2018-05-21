@@ -1,0 +1,272 @@
+---
+title: "Classe Predicting"
+author: "Agelink"
+date: "May 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+
+Six test subjects (identified by name) were asked to perform certain exercises
+using five different methods (labelled A-E). They were wearing accelerometers
+generating data. The challenge here is to create a
+machine learning model with the training data to predict
+the exercise method in the testing data.
+
+To download the data:
+```{r dl}
+##trnurl="https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv"
+##download.file(trnurl,destfile="pml-training.csv",method="auto")
+##tsturl="https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv"
+##download.file(tsturl,destfile="pml-testing.csv",method="auto")
+```
+
+For more information and citation, see Source/credits below.
+
+## Data loading and cleaning
+
+Let's read in the training csv file, also interpreting blank values as NA, and
+looking at the amount of missing values.
+
+```{r readindata}
+cldata <- read.csv("pml-training.csv", na.strings=c("","NA"), stringsAsFactors = F)
+paste("rows:",nrow(cldata)," . ","columns:",ncol(cldata)," . ",
+      "percent NA:",round(100*sum(is.na(cldata))/(nrow(cldata)*ncol(cldata))))
+```
+
+Having so many NAs may hinder the training of statistical models.
+Let's see if there is any pattern to where the NA values are.
+
+```{r wherearenas}
+nas <- NULL
+for(i in 1:ncol(cldata)) nas<-c(nas, sum(is.na(cldata[,i])))
+table(nas)
+```
+
+In 60 columns, there are no NAs at all, and in 100 columns, 19216
+out of 19622 rows are NA. It is unlikely that those columns will be useful
+for predictions. Let's remove them.
+
+```{r nonas}
+cldata <- cldata[,grep("^0$",nas)]       ## subset keeping only columns with 0 NAs
+cldata[1,]
+```
+
+The classe variable is what we are trying to predict.
+The X column is not useful for prediction, it contains just numeric labels.
+The timestamps and information about the exercise windows might be parsed into
+time series data, but there are many other predictors and it would be simpler
+if we could just predict with those.
+
+```{r remove17}
+cldata <- cldata[,c(-1,-3,-4,-5,-6,-7)] ## replace cldata with subset with removed columns
+```
+
+## Split into train and test
+
+Since we have so many observations, we can split in a training set, a test set
+and a validation set. The training set will be used for training models, we
+can see how well they perform on the test set, but if we do some tweaking
+based on those results, it is good to have some validation data set aside to
+test the final prediction method(s) before we move to the
+actual testing file where we do not know the real outcome.
+
+```{r splitting}
+suppressMessages(library(caret))
+set.seed(3456)                 ## This and later set.seed commands are for reproducibility
+InTrain   <- createDataPartition(cldata$classe, p=0.7, list=F)
+cltrain   <- cldata[InTrain,]
+cltestval <- cldata[-InTrain,]
+set.seed(3456)
+InTest    <- createDataPartition(cltestval$classe, p=0.8, list=F)
+cltest    <- cltestval[InTest,]
+clvalid   <- cltestval[-InTest,]
+```
+
+## Comparing models
+
+Random forests usually work well on classification problems.
+
+```{r rf}
+suppressMessages(library(randomForest))
+suppressMessages(library(e1071))
+set.seed(6543)
+rfmodel <- train(classe~., method="rf", data=cltrain)
+rfpreds <- predict(rfmodel, newdata=cltest)
+table(cltest$classe, rfpreds) ## the diagonal (e.g. row C column C) are correct predictions
+paste(sum(cltest$classe==rfpreds),"correct out of",nrow(cltest),
+      "= accuracy percentage",100*sum(cltest$classe==rfpreds)/nrow(cltest))
+```
+
+Using default settings, this is already great accuracy.
+But let's see if we can improve even more.
+
+Another well-regarded method for classification is support vector machines.
+
+```{r svm}
+suppressMessages(library(kernlab))
+set.seed(6543)
+svmmodel <- train(classe~., method="svmPoly", data=cltrain)
+svmpreds <- predict(svmmodel, newdata=cltest)
+table(cltest$classe, svmpreds)
+paste(sum(cltest$classe==svmpreds),"correct out of",nrow(cltest),
+      "= accuracy percentage",100*sum(cltest$classe==svmpreds)/nrow(cltest))
+```
+
+This is only very slightly worse than the random forest.
+If they get many of the same predictions wrong though, it is not worth
+it to try to combine/stack the two.
+
+```{r agreement}
+sum(cltest$classe!=rfpreds & cltest$classe!=svmpreds)
+```
+
+Only in 3 cases do both models get it wrong. So in the rest of the cases,
+at least one of the models correctly predicts.
+If we use a tiebreaker model that should at least outperform randomly guessing
+which of the two models got it right when they disagree, accuracy is
+likely to improve.
+
+```{r qda}
+suppressMessages(library(MASS))
+set.seed(6543)
+qdamodel <- train(classe~., method="qda", data=cltrain)
+qdapreds <- predict(qdamodel, newdata=cltest)
+table(cltest$classe,qdapreds)
+paste(sum(cltest$classe==qdapreds),"correct out of",nrow(cltest),
+      "= accuracy percentage",100*sum(cltest$classe==qdapreds)/nrow(cltest))
+```
+
+Not bad. Let's take the rf predictions and only overrule those
+when the svm predictions and the qda (quadratic discriminant analysis)
+predictions agree on another value.
+
+```{r blend}
+ap <- as.data.frame(rfpreds)  ## ap stands for "all predictions" here
+ap$svmpreds <- svmpreds
+ap$qdapreds <- qdapreds
+## The ap data frame now has the three sets of predictions.
+## First, we make the random forest predictions the 'default' final predictions.
+ap$finalpreds <- ap$rfpreds
+## Then we record where the rf prediction is not the same as the svm prediction,
+## but the qda prediction matches the svm prediction, ie: rf gets outvoted.
+ap$rf_outvoted <- ap$rfpreds!=ap$svmpreds & ap$svmpreds==ap$qdapreds
+## Now we replace any outvoted rf prediction with the svm (=qda) prediction.
+for (i in 1:nrow(ap)) if (ap[i,5]==TRUE) ap[i,4]<-ap[i,2]
+ap$realoutcome<-cltest$classe
+paste(sum(cltest$classe==ap$finalpreds),"correct out of",nrow(cltest),
+      "= accuracy percentage",100*sum(ap$realoutcome==ap$finalpreds)/nrow(cltest))
+```
+
+The improvement is not there, in fact the qda model happens
+to side with incorrect predictions slightly more often than not here.
+We will probably end up using the random forest model by itself, so before
+we move to the validation set, we can use the ap data frame to try
+some simpler method to adjust, making it likely we will be overfitting.
+Let's look at the disagreements between the models and the categories both are
+then more likely to get wrong.
+
+```{r manualcorrect}
+Aconflict<-subset(ap,rfpreds=="A" & svmpreds!="A")
+Bconflict<-subset(ap,rfpreds=="B" & svmpreds!="B")
+Cconflict<-subset(ap,rfpreds=="C" & svmpreds!="C")
+Dconflict<-subset(ap,rfpreds=="D" & svmpreds!="D")
+Econflict<-subset(ap,rfpreds=="E" & svmpreds!="E")
+Areport<-paste("When rf predicts A and svm does not, rf is right in",
+      sum(Aconflict$realoutcome=="A"),"out of",nrow(Aconflict),"case(s)")
+Breport<-paste("When rf predicts B and svm does not, rf is right in",
+      sum(Bconflict$realoutcome=="B"),"out of",nrow(Bconflict),"case(s)")
+Creport<-paste("When rf predicts C and svm does not, rf is right in",
+      sum(Cconflict$realoutcome=="C"),"out of",nrow(Cconflict),"case(s)")
+Dreport<-paste("When rf predicts D and svm does not, rf is right in",
+      sum(Dconflict$realoutcome=="D"),"out of",nrow(Dconflict),"case(s)")
+Ereport<-paste("When rf predicts E and svm does not, rf is right in",
+      sum(Econflict$realoutcome=="E"),"out of",nrow(Econflict),"case(s)")
+cat(Areport,Breport,Creport,Dreport,Ereport,sep="\n")
+```
+
+So when rf predicts B, D or E and svm does not, we will trust rf.
+When rf predicts A or C and svm does not, we will trust svm instead.
+
+This surely improves accuracy on the cltest set, so let's immediately move to
+the validation set and compare the three options there.
+
+```{r rfvalid}
+vrfpreds <- predict(rfmodel,newdata=clvalid)
+paste(sum(clvalid$classe==vrfpreds),"correct out of",nrow(clvalid),
+      "= accuracy percentage",100*sum(clvalid$classe==vrfpreds)/nrow(clvalid))
+```
+
+The accuracy of the random forest model is still very good.
+
+```{r svmvalid}
+vsvmpreds <- predict(svmmodel,newdata=clvalid)
+paste(sum(clvalid$classe==vsvmpreds),"correct out of",nrow(clvalid),
+      "= accuracy percentage",100*sum(clvalid$classe==vsvmpreds)/nrow(clvalid))
+```
+
+The support vector machine model works nearly as well as the random forest again.
+
+```{r manualoverrules}
+vap <- as.data.frame(vrfpreds)
+vap$vsvmpreds <- vsvmpreds
+vap$vfinalpreds <- vap$vrfpreds
+for (i in 1:nrow(vap)) if (vap[i,1]=="A"&vap[i,2]!="A") vap[i,3]<-vap[i,2]
+for (i in 1:nrow(vap)) if (vap[i,1]=="C"&vap[i,2]!="C") vap[i,3]<-vap[i,2]
+paste(sum(clvalid$classe==vap$vfinalpreds),"correct out of",nrow(clvalid),
+      "= accuracy percentage",100*sum(clvalid$classe==vap$vfinalpreds)/nrow(clvalid))
+```
+
+Somewhat surprisingly, as the overfitting risk seemed quite high, the crude
+correction mechanism actually improves accuracy on the validation set, about
+halving the (admittedly low) number of errors made by the rf and svm models.
+Perhaps each model did in fact have slight weaknesses with some categories.
+
+## Conclusion - Final prediction
+
+Before we actually use the overrule mechanism, we may first check if the two
+models disagree on any predictions for the actual pml-testing data that we will
+load now.
+
+```{r finalpred}
+clnew <- read.csv("pml-testing.csv", na.strings=c("","NA"), stringsAsFactors = F)
+predict(rfmodel, newdata=clnew)
+predict(svmmodel, newdata=clnew)
+```
+
+The two models agree on the predictions for these 20 observations, so there is
+no need to let either be overruled by the other.
+
+## Discussion
+
+For the purposes of this project, prediction accuracy was paramount, but 
+both random forests and support vector machines were
+quite computationally intensive for data this big, possibly also due
+to caret's default settings.
+In this case, letting three models 'vote' did not work too well, but it may be
+interesting to
+combine models that are not too accurate by themselves, but do take 
+less time to train. The training of the qda model was
+near-instantaneous (on a normal desktop computer)
+compared to the random forest and the support vector machine, and its accuracy
+was not bad. Pairing it with the right other 'quick' models might have
+yielded high accuracy.
+
+## Source / credits
+
+The data for this project come from this source:
+http://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har
+
+Citation:
+Ugulino, W.; Cardador, D.; Vega, K.; Velloso, E.; Milidiu, R.; Fuks, H. Wearable Computing: Accelerometers' Data Classification of Body Postures and Movements. Proceedings of 21st Brazilian Symposium on Artificial Intelligence. Advances in Artificial Intelligence - SBIA 2012. In: Lecture Notes in Computer Science. , pp. 52-61. Curitiba, PR: Springer Berlin / Heidelberg, 2012. ISBN 978-3-642-34458-9. DOI: 10.1007/978-3-642-34459-6_6. 
+
+Software used:
+
+```{r}
+date()
+sessionInfo()
+```
